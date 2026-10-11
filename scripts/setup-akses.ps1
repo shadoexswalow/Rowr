@@ -22,8 +22,18 @@ try {
     if (-not (Get-File 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' $msi 90)) { throw 'Unduhan Tailscale gagal' }
     $signature=Get-AuthenticodeSignature $msi
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Tailscale') { throw 'Signature installer Tailscale tidak valid' }
-    $install=Run-Bounded 'msiexec.exe' @('/i',"`"$msi`"",'/qn','/norestart') 300
-    if ($install.code -notin @(0,3010)) { throw "Installer Tailscale gagal, exit $($install.code)" }
+    
+    # PERBAIKAN: Menambahkan parameter log dan mode instalasi yang aman untuk runner
+    $logPath = Join-Path $work 'tailscale_install.log'
+    $install=Run-Bounded 'msiexec.exe' @('/i',"`"$msi`"",'/qn','/norestart','REBOOT=ReallySuppress',"/l*v `"$logPath`"") 300
+    if ($install.code -notin @(0,3010)) { 
+      if (Test-Path $logPath) {
+        $logContent = Get-Content $logPath -Tail 30 -ErrorAction SilentlyContinue
+        Write-Host "--- MSI INSTALL LOG TAIL ---"
+        $logContent | Write-Host
+      }
+      throw "Installer Tailscale gagal, exit $($install.code)" 
+    }
   }
   if (-not (Test-Path $exe)) { throw 'Tailscale CLI tidak ditemukan' }
   Start-Service Tailscale -ErrorAction Stop
@@ -42,8 +52,7 @@ try {
   } while ((Get-Date) -lt $deadline)
   if (-not $listener) { throw 'Tailscale tersambung tetapi listener RDP 3389 belum aktif; periksa setup-rdp.' }
   # Restrict known RDP rules to the private tailnet address space.
-  Get-NetFirewallRule -Name 'RemoteDesktop-*' -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
-  Get-NetFirewallRule -DisplayName 'XyDesk Remote*' -ErrorAction SilentlyContinue | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
+  Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'RemoteDesktop-*' -or $_.DisplayName -like 'XyDesk Remote*' } | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
   Update-Status @{ akses=@{mode='tailscale';tailscale=@{status='ok';ip="$ip";magicdns="$($status.Self.DNSName)";hostname=$hostName;note='HP/PC harus login Tailscale pada tailnet yang sama. TCP 3389 harus diizinkan ACL.'}} } | Out-Null
   Log "Tailscale siap: $ip`:3389. Tidak ada akses publik."
 } catch {
