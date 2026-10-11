@@ -16,41 +16,54 @@ function Run-Bounded([string]$File, [string[]]$ArgsList, [int]$Seconds=90) {
 }
 try {
   if (-not $env:TAILSCALE_AUTH_KEY) { throw 'Isi secret TAILSCALE_AUTH_KEY terlebih dahulu.' }
-  $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+  
+  # Gunakan folder instalasi custom untuk mode standalone/portable jika belum ada
+  $tailscaleDir = "$env:ProgramFiles\Tailscale"
+  $exe = "$tailscaleDir\tailscale.exe"
+  
   if (-not (Test-Path $exe)) {
-    $msi=Join-Path $work 'tailscale.msi'
-    if (-not (Get-File 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' $msi 90)) { throw 'Unduhan Tailscale gagal' }
-    $signature=Get-AuthenticodeSignature $msi
-    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Tailscale') { throw 'Signature installer Tailscale tidak valid' }
+    New-Item -ItemType Directory -Path $tailscaleDir -Force | Out-Null
+    $zip = Join-Path $work 'tailscale.zip'
     
-    # PERBAIKAN: Menambahkan parameter log dan mode instalasi yang aman untuk runner
-    $logPath = Join-Path $work 'tailscale_install.log'
-    $install=Run-Bounded 'msiexec.exe' @('/i',"`"$msi`"",'/qn','/norestart','REBOOT=ReallySuppress',"/l*v `"$logPath`"") 300
-    if ($install.code -notin @(0,3010)) { 
-      if (Test-Path $logPath) {
-        $logContent = Get-Content $logPath -Tail 30 -ErrorAction SilentlyContinue
-        Write-Host "--- MSI INSTALL LOG TAIL ---"
-        $logContent | Write-Host
-      }
-      throw "Installer Tailscale gagal, exit $($install.code)" 
+    # Download arsip zip resmi Tailscale untuk Windows (tanpa MSI)
+    if (-not (Get-File 'https://pkgs.tailscale.com/stable/tailscale-latest-amd64.zip' $zip 90)) { throw 'Unduhan Tailscale gagal' }
+    
+    # Ekstrak file zip langsung ke folder Program Files\Tailscale
+    Expand-Archive -Path $zip -DestinationPath $work -Force
+    $extractedFolder = Get-ChildItem -Path $work -Directory | Where-Object { $_.Name -match 'tailscale-' } | Select-Object -First 1
+    if ($extractedFolder) {
+      Copy-Item -Path "$($extractedFolder.FullName)\*" -Destination $tailscaleDir -Recurse -Force
+    } else {
+      throw 'Ekstraksi Tailscale gagal'
     }
   }
+  
   if (-not (Test-Path $exe)) { throw 'Tailscale CLI tidak ditemukan' }
-  Start-Service Tailscale -ErrorAction Stop
+  
+  # Jalankan tailscaled (daemon) jika belum berjalan, lalu gunakan tailscale.exe up
+  $daemon = "$tailscaleDir\tailscaled.exe"
+  if (Test-Path $daemon) {
+    Start-Process -FilePath $daemon -ArgumentList '--tun=userspace-networking' -WindowStyle Hidden -ErrorAction SilentlyContinue
+  }
+  
   $hostName=("$env:HOSTNAME-$env:GITHUB_RUN_NUMBER" -replace '[^a-zA-Z0-9-]','').Trim('-')
   if (-not $hostName) { $hostName='rdpfree' }; if ($hostName.Length -gt 60) { $hostName=$hostName.Substring(0,60) }
+  
   $up=Run-Bounded $exe @('up',"--auth-key=$env:TAILSCALE_AUTH_KEY","--hostname=$hostName",'--accept-dns=false','--timeout=90s') 120
   if ($up.code -ne 0) { throw 'Tailscale menolak koneksi. Periksa masa berlaku auth key dan persetujuan perangkat di tailnet.' }
+  
   $state=Run-Bounded $exe @('status','--json') 30
   $status=$state.text | ConvertFrom-Json
   $ip=@($status.Self.TailscaleIPs | Where-Object { $_ -match '^100\.' }) | Select-Object -First 1
   if ($status.BackendState -ne 'Running' -or -not $ip) { throw 'Tailscale belum siap atau belum disetujui oleh pemilik tailnet' }
+  
   $deadline=(Get-Date).AddSeconds(90)
   do {
     $listener=Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
     if ($listener) { break }; Start-Sleep -Seconds 3
   } while ((Get-Date) -lt $deadline)
   if (-not $listener) { throw 'Tailscale tersambung tetapi listener RDP 3389 belum aktif; periksa setup-rdp.' }
+  
   # Restrict known RDP rules to the private tailnet address space.
   Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'RemoteDesktop-*' -or $_.DisplayName -like 'XyDesk Remote*' } | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10' -ErrorAction SilentlyContinue
   Update-Status @{ akses=@{mode='tailscale';tailscale=@{status='ok';ip="$ip";magicdns="$($status.Self.DNSName)";hostname=$hostName;note='HP/PC harus login Tailscale pada tailnet yang sama. TCP 3389 harus diizinkan ACL.'}} } | Out-Null
